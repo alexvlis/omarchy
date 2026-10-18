@@ -1,18 +1,18 @@
-"""Publish Omarchy's confirmed session-lock state to desktop applications."""
+"""Publish confirmed session-lock state to Omarchy's shared screensaver service."""
 
 import os
 import sys
 
 from gi.repository import Gio, GLib
 
-# ScreenSaver is the desktop compatibility protocol for session-lock notifications.
-BUS_NAME = "org.freedesktop.ScreenSaver"
-OBJECT_PATH = "/org/freedesktop/ScreenSaver"
+# Only omarchy-idle-inhibit owns the public desktop compatibility interface.
+BUS_NAME = "org.omarchy.SessionLock"
+OBJECT_PATH = "/org/omarchy/SessionLock"
 REQUEST_NAME_DO_NOT_QUEUE = 4
 REQUEST_NAME_PRIMARY_OWNER = 1
 INTERFACE_XML = """
 <node>
-  <interface name="org.freedesktop.ScreenSaver">
+  <interface name="org.omarchy.SessionLock">
     <method name="GetActive">
       <arg type="b" direction="out"/>
     </method>
@@ -28,14 +28,19 @@ class SessionLockBridge:
   def __init__(self, connection, main_loop):
     self.connection = connection
     self.main_loop = main_loop
-    self.is_locked = False
+    self.is_locked = None
     self.input_buffer = b""
     self.exit_code = 0
 
   def handle_get_active(
     self, connection, sender, path, interface, method, parameters, invocation
   ):
-    invocation.return_value(GLib.Variant("(b)", (self.is_locked,)))
+    if self.is_locked is None:
+      invocation.return_dbus_error(
+        "org.omarchy.SessionLock.NotReady", "Waiting for compositor state"
+      )
+    else:
+      invocation.return_value(GLib.Variant("(b)", (self.is_locked,)))
 
   def publish_lock_state(self, is_locked):
     if is_locked == self.is_locked:
@@ -82,7 +87,7 @@ class SessionLockBridge:
 
 
 def request_bus_name(connection):
-  # Do not replace or queue behind another desktop's screensaver service.
+  # Only one lock publisher can represent the compositor-confirmed state.
   reply = connection.call_sync(
     "org.freedesktop.DBus",
     "/org/freedesktop/DBus",

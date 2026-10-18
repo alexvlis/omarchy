@@ -1,3 +1,4 @@
+import atexit
 import json
 import os
 import select
@@ -13,6 +14,7 @@ from gi.repository import Gio, GLib
 
 BUS_NAME = "org.freedesktop.ScreenSaver"
 OBJECT_PATH = "/org/freedesktop/ScreenSaver"
+LOCK_NAME = "org.omarchy.SessionLock"
 bridge_script = Path(os.environ["ROOT"]) / "shell/plugins/lock/session-lock-bridge.py"
 connection = Gio.bus_get_sync(Gio.BusType.SESSION, None)
 context = GLib.MainContext.default()
@@ -93,11 +95,51 @@ def bus_call(method, arguments, return_type):
 
 
 def bridge_has_owner():
-  return bus_call("NameHasOwner", GLib.Variant("(s)", (BUS_NAME,)), "(b)")
+  return bus_call("NameHasOwner", GLib.Variant("(s)", (LOCK_NAME,)), "(b)")
 
 
 def bridge_process_id():
-  return bus_call("GetConnectionUnixProcessID", GLib.Variant("(s)", (BUS_NAME,)), "(u)")
+  return bus_call("GetConnectionUnixProcessID", GLib.Variant("(s)", (LOCK_NAME,)), "(u)")
+
+
+daemon_directory = TemporaryDirectory(prefix="omarchy-screensaver-")
+atexit.register(daemon_directory.cleanup)
+daemon_command = [
+  sys.executable, str(Path(os.environ["ROOT"]) / "bin/omarchy-idle-inhibit"),
+  "--state-file", str(Path(daemon_directory.name) / "state"),
+]
+
+
+def start_daemon():
+  daemon = subprocess.Popen(daemon_command)
+
+  def stop():
+    if daemon.poll() is None:
+      daemon.terminate()
+      daemon.wait(timeout=3)
+
+  atexit.register(stop)
+  wait_for(lambda: bus_call("NameHasOwner", GLib.Variant("(s)", (BUS_NAME,)), "(b)"))
+  return daemon
+
+
+assert bus_call("RequestName", GLib.Variant("(su)", (BUS_NAME, 4)), "(u)") == 1
+state_path = Path(daemon_directory.name) / "state"
+state_path.write_text("existing owner state")
+try:
+  denied = subprocess.run(daemon_command, capture_output=True, timeout=3)
+  assert denied.returncode == 1, denied.stderr
+  assert b"unavailable; exiting for retry" in denied.stderr
+  assert state_path.read_text() == "existing owner state"
+  assert bus_call("GetNameOwner", GLib.Variant("(s)", (BUS_NAME,)), "(s)") == connection.get_unique_name()
+  pass_check("public name conflict exits unsuccessfully without replacing the owner or its state")
+finally:
+  bus_call("ReleaseName", GLib.Variant("(s)", (BUS_NAME,)), "(u)")
+  state_path.unlink()
+
+daemon = start_daemon()
+assert get_active() is False
+pass_check("shared service acquires the public name when restarted after the conflict clears")
 
 
 def test_quickshell_connection():
@@ -233,6 +275,9 @@ child = start_bridge()
 try:
   assert select.select([child.stdout], [], [], 3)[0], "bridge did not start"
   assert child.stdout.readline() == b"ready\n"
+  send_lock_state(child, b"false\n")
+  wait_for(lambda: lock_events == [False])
+  lock_events.clear()
   assert get_active() is False
   pass_check("screensaver service starts inactive and answers GetActive")
 
@@ -253,33 +298,74 @@ try:
     "lock transitions stay ordered and repeated states emit no duplicate signals"
   )
 
+  public_owner = bus_call("GetNameOwner", GLib.Variant("(s)", (BUS_NAME,)), "(s)")
+  for path in (OBJECT_PATH, "/ScreenSaver"):
+    cookie = connection.call_sync(
+      BUS_NAME, path, BUS_NAME, "Inhibit",
+      GLib.Variant("(ss)", ("lock-test", "video")),
+      GLib.VariantType.new("(u)"), Gio.DBusCallFlags.NONE, 2000, None,
+    ).unpack()[0]
+    expected_count = len(lock_events) + 2
+    send_lock_state(child, b"true\n")
+    wait_for(lambda: get_active() is True)
+    assert connection.call_sync(
+      BUS_NAME, path, BUS_NAME, "GetActive", None,
+      GLib.VariantType.new("(b)"), Gio.DBusCallFlags.NONE, 2000, None,
+    ).unpack()[0] is True
+    send_lock_state(child, b"false\n")
+    wait_for(lambda count=expected_count: len(lock_events) == count)
+    assert get_active() is False
+    state = json.loads((Path(daemon_directory.name) / "state").read_text())
+    assert state["count"] == 1
+    connection.call_sync(
+      BUS_NAME, path, BUS_NAME, "UnInhibit", GLib.Variant("(u)", (cookie,)),
+      None, Gio.DBusCallFlags.NONE, 2000, None,
+    )
+    assert bus_call("GetNameOwner", GLib.Variant("(s)", (BUS_NAME,)), "(s)") == public_owner
+  pass_check("one public owner serves inhibitors on both paths while forwarding lock changes")
+  lock_events.clear()
+
   competing = start_bridge()
   try:
     stdout, stderr = competing.communicate(timeout=3)
     assert competing.returncode == 0, stderr
     assert stdout == b"", stdout
     assert get_active() is False
-    pass_check("bridge never replaces or queues behind an existing screensaver owner")
+    pass_check("a second lock publisher cannot replace or queue behind the first")
   finally:
     if competing.poll() is None:
       competing.kill()
       competing.wait()
 
   send_lock_state(child, b"true\n")
-  wait_for(lambda: lock_events == [True, False, True, False, True])
+  wait_for(lambda: lock_events == [True])
   child.stdin.close()
   assert child.wait(timeout=3) == 0, child.stderr.read()
   assert child.stderr.read() == b""
   while context.pending():
     context.iteration(False)
-  assert lock_events == [True, False, True, False, True], lock_events
+  assert lock_events == [True], lock_events
   pass_check("parent exit releases the bus name without announcing a false unlock")
 
   child = start_bridge()
   assert select.select([child.stdout], [], [], 3)[0], "replacement bridge did not start"
   assert child.stdout.readline() == b"ready\n"
+  assert get_active() is True
+  send_lock_state(child, b"false\n")
+  wait_for(lambda: get_active() is False)
   assert get_active() is False
-  pass_check("replacement bridge can acquire the name after its predecessor exits")
+  pass_check("publisher loss retains the secure state until its replacement publishes")
+
+  send_lock_state(child, b"true\n")
+  wait_for(lambda: get_active() is True)
+  wait_for(lambda: lock_events[-1] is True)
+  lock_events.clear()
+  daemon.terminate()
+  daemon.wait(timeout=3)
+  daemon = start_daemon()
+  wait_for(lambda: get_active() is True)
+  wait_for(lambda: lock_events == [True])
+  pass_check("shared service restart queries and announces the existing publisher's secure state")
 
   send_lock_state(child, b"preview\n")
   assert child.wait(timeout=3) == 1
