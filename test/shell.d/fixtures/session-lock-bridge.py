@@ -137,6 +137,62 @@ finally:
   bus_call("ReleaseName", GLib.Variant("(s)", (BUS_NAME,)), "(u)")
   state_path.unlink()
 
+
+def test_state_write_failure(trigger):
+  with TemporaryDirectory(dir=daemon_directory.name) as directory:
+    state = Path(directory) / "state"
+    temporary_state = Path(directory) / "state.tmp"
+    if trigger == "startup":
+      temporary_state.mkdir()
+    process = subprocess.Popen(
+      [*daemon_command, "--state-file", str(state)],
+      stderr=subprocess.PIPE,
+    )
+    holder = None
+    try:
+      if trigger != "startup":
+        wait_for(state.exists)
+        holder = Gio.DBusConnection.new_for_address_sync(
+          os.environ["DBUS_SESSION_BUS_ADDRESS"],
+          Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
+          None, None,
+        )
+        cookie = holder.call_sync(
+          BUS_NAME, OBJECT_PATH, BUS_NAME, "Inhibit",
+          GLib.Variant("(ss)", ("write-failure-test", "video")),
+          GLib.VariantType.new("(u)"), Gio.DBusCallFlags.NONE, 2000, None,
+        ).unpack()[0]
+        assert json.loads(state.read_text())["count"] == 1
+        # A directory at the temporary filename forces a real filesystem error.
+        temporary_state.mkdir()
+        if trigger == "release":
+          holder.call_sync(
+            BUS_NAME, OBJECT_PATH, BUS_NAME, "UnInhibit",
+            GLib.Variant("(u)", (cookie,)), None, Gio.DBusCallFlags.NONE, 2000, None,
+          )
+        else:
+          holder.close_sync(None)
+      assert process.wait(timeout=3) == 1
+      assert b"cannot write" in process.stderr.read()
+      if trigger != "startup":
+        assert json.loads(state.read_text())["count"] == 1
+        probe = subprocess.run(
+          [str(Path(os.environ["ROOT"]) / "bin/omarchy-idle-inhibit-probe"), str(state)],
+          capture_output=True, text=True, check=True,
+        )
+        assert probe.stdout == "\n", probe.stdout
+      pass_check(f"{trigger} state-write failure exits nonzero so stale inhibitors cannot stay trusted")
+    finally:
+      if holder is not None and not holder.is_closed():
+        holder.close_sync(None)
+      if process.poll() is None:
+        process.kill()
+        process.wait()
+
+
+for trigger in ("startup", "release", "disconnect"):
+  test_state_write_failure(trigger)
+
 daemon = start_daemon()
 assert get_active() is False
 pass_check("shared service acquires the public name when restarted after the conflict clears")

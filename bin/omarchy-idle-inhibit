@@ -192,6 +192,10 @@ class Daemon:
       self.publish()
     except OSError as error:
       print(f"omarchy-idle-inhibit: cannot write {self.state_file} ({error})", file=sys.stderr)
+      # A live PID would make the idle probe trust a stale positive count.
+      self.exit_code = 1
+      if self.loop is not None:
+        self.loop.quit()
 
   def handle_inhibit(self, sender: str, params: GLib.Variant, invocation: Gio.DBusMethodInvocation) -> None:
     app, reason = params.unpack()
@@ -251,10 +255,7 @@ class Daemon:
   def own_name(self, name: str) -> None:
     def on_acquired(connection, acquired) -> None:
       self.owned_names += 1
-      try:
-        self.publish()
-      except OSError as error:
-        print(f"omarchy-idle-inhibit: cannot write {self.state_file} ({error})", file=sys.stderr)
+      self.after_change()
 
     def on_lost(connection, lost) -> None:
       print(f"omarchy-idle-inhibit: {lost} unavailable; exiting for retry", file=sys.stderr)
