@@ -24,14 +24,6 @@ function delayAfterFirstIdle(timeoutSeconds, firstIdleSeconds) {
   return delay > 0 ? delay : 0
 }
 
-function eventParts(event, count) {
-  try {
-    if (event && event.parse) return event.parse(count)
-  } catch (error) {
-  }
-  return String(event && event.data ? event.data : "").split(",")
-}
-
 // The idle-inhibit daemon writes {count, holders, pid, inhibited}. A missing
 // file, unparseable JSON, or a non-numeric count all mean "no inhibitors" so
 // a daemon failure clears a stale nonzero count instead of disabling the lock.
@@ -57,44 +49,11 @@ function inhibitorTransition(previous, current) {
   return "noop"
 }
 
-function screensaverWindowsAfter(windows, address, visible) {
-  var key = String(address || "")
-  if (!key) {
-    var current = windows || {}
-    var existingCount = 0
-    for (var currentKey in current) {
-      if (current[currentKey]) existingCount++
-    }
-    return { windows: current, count: existingCount }
-  }
-
-  var next = {}
-  var count = 0
-  for (var existing in windows || {}) {
-    if (existing !== key && windows[existing]) {
-      next[existing] = true
-      count++
-    }
-  }
-
-  if (visible) {
-    next[key] = true
-    count++
-  }
-
-  return {
-    windows: next,
-    count: count
-  }
-}
-
 if (typeof module !== "undefined") {
   module.exports = {
     secondsFromConfig: secondsFromConfig,
     firstIdleTimeout: firstIdleTimeout,
     delayAfterFirstIdle: delayAfterFirstIdle,
-    eventParts: eventParts,
-    screensaverWindowsAfter: screensaverWindowsAfter,
     inhibitorCountFromText: inhibitorCountFromText,
     inhibitorTransition: inhibitorTransition
   }
